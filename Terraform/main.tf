@@ -114,6 +114,9 @@ resource "google_cloud_run_v2_service" "streamlit" {
   template {
     service_account = google_service_account.cloud_run_sa.email
 
+    session_affinity = true
+    timeout          = "3600s"
+
     containers {
       image = "${var.region}-docker.pkg.dev/${var.project_id}/waste-classifier/waste-classifier-ui:${var.app_image_tag}"
 
