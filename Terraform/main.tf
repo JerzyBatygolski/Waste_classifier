@@ -25,45 +25,12 @@ resource "google_artifact_registry_repository" "waste_classifier" {
 }
 
 # ---------------------------------------------------------------------------
-# Cloud Storage - bucket for uploaded user images
-# ---------------------------------------------------------------------------
-
-resource "google_storage_bucket" "user_images" {
-  name          = "${var.project_id}-waste-images"
-  location      = var.region
-  force_destroy = false
-
-  uniform_bucket_level_access = true
-
-  lifecycle_rule {
-    condition {
-      age = 30
-    }
-    action {
-      type = "Delete"
-    }
-  }
-}
-
-# ---------------------------------------------------------------------------
 # Service Account for Cloud Run
 # ---------------------------------------------------------------------------
 
 resource "google_service_account" "cloud_run_sa" {
   account_id   = "waste-classifier-sa"
   display_name = "Waste Classifier Cloud Run Service Account"
-}
-
-resource "google_project_iam_member" "storage_object_creator" {
-  project = var.project_id
-  role    = "roles/storage.objectCreator"
-  member  = "serviceAccount:${google_service_account.cloud_run_sa.email}"
-}
-
-resource "google_project_iam_member" "storage_object_viewer" {
-  project = var.project_id
-  role    = "roles/storage.objectViewer"
-  member  = "serviceAccount:${google_service_account.cloud_run_sa.email}"
 }
 
 # ---------------------------------------------------------------------------
@@ -83,7 +50,7 @@ resource "google_cloud_run_v2_service" "waste_classifier_api" {
     }
 
     containers {
-      image = "${var.region}-docker.pkg.dev/${var.project_id}/waste-classifier/waste-classifier-api:${var.image_tag}"
+      image = "${var.region}-docker.pkg.dev/${var.project_id}/waste-classifier/waste-classifier-api:${var.api_image_tag}"
 
       resources {
         limits = {
@@ -105,10 +72,6 @@ resource "google_cloud_run_v2_service" "waste_classifier_api" {
       env {
         name  = "MAX_FILE_SIZE_MB"
         value = "10"
-      }
-      env {
-        name  = "GCS_BUCKET"
-        value = google_storage_bucket.user_images.name
       }
 
       startup_probe {
@@ -141,19 +104,6 @@ resource "google_cloud_run_v2_service" "waste_classifier_api" {
 }
 
 # ---------------------------------------------------------------------------
-# Make Cloud Run service publicly accessible (no auth required)
-# Remove this block if you want to require authentication
-# ---------------------------------------------------------------------------
-
-resource "google_cloud_run_v2_service_iam_member" "public_access" {
-  project  = google_cloud_run_v2_service.waste_classifier_api.project
-  location = google_cloud_run_v2_service.waste_classifier_api.location
-  name     = google_cloud_run_v2_service.waste_classifier_api.name
-  role     = "roles/run.invoker"
-  member   = "allUsers"
-}
-
-# ---------------------------------------------------------------------------
 # Cloud Run - Streamlit Application
 # ---------------------------------------------------------------------------
 
@@ -162,8 +112,10 @@ resource "google_cloud_run_v2_service" "streamlit" {
   location = var.region
 
   template {
+    service_account = google_service_account.cloud_run_sa.email
+
     containers {
-      image = "${var.region}-docker.pkg.dev/${var.project_id}/waste-classifier/waste-classifier-ui:latest"
+      image = "${var.region}-docker.pkg.dev/${var.project_id}/waste-classifier/waste-classifier-ui:${var.app_image_tag}"
 
       resources {
         limits = {
@@ -189,6 +141,21 @@ resource "google_cloud_run_v2_service" "streamlit" {
     type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
     percent = 100
   }
+
+  depends_on = [google_artifact_registry_repository.waste_classifier]
+}
+
+# ---------------------------------------------------------------------------
+# Make Cloud Run service publicly accessible (no auth required)
+# Remove this block if you want to require authentication
+# ---------------------------------------------------------------------------
+
+resource "google_cloud_run_v2_service_iam_member" "public_access" {
+  project  = google_cloud_run_v2_service.waste_classifier_api.project
+  location = google_cloud_run_v2_service.waste_classifier_api.location
+  name     = google_cloud_run_v2_service.waste_classifier_api.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
 }
 
 resource "google_cloud_run_v2_service_iam_member" "streamlit_public" {
@@ -197,9 +164,4 @@ resource "google_cloud_run_v2_service_iam_member" "streamlit_public" {
   name     = google_cloud_run_v2_service.streamlit.name
   role     = "roles/run.invoker"
   member   = "allUsers"
-}
-
-output "streamlit_url" {
-  description = "Public URL of the Streamlit UI"
-  value       = google_cloud_run_v2_service.streamlit.uri
 }

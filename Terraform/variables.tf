@@ -9,8 +9,12 @@ variable "region" {
   default     = "europe-central2"
 }
 
-variable "image_tag" {
-  description = "Docker image tag to deploy to Cloud Run"
+variable "api_image_tag" {
+  description = "Docker image tag to deploy the API to Cloud Run"
   type        = string
-  default     = "latest"
+}
+
+variable "app_image_tag" {
+  description = "Docker image tag to deploy the Application to Cloud Run"
+  type        = string
 }
