@@ -1,7 +1,7 @@
-API/terraform/**
-!API/terraform/main.tf
-!API/terraform/outputs.tf
-!API/terraform/variables.tf
+Terraform/**
+!Terraform/main.tf
+!Terraform/outputs.tf
+!Terraform/variables.tf
 
 Classifier/**
 !Classifier/output/
