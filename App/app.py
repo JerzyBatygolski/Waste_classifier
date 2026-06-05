@@ -29,6 +29,11 @@ from PIL import Image, ImageOps
 
 API_URL = os.getenv("API_URL", "https://waste-classifier-api-spsy2vhjeq-lm.a.run.app")
 
+# Preprocessing geometry - must match the API / training pipeline.
+# Letterbox = resize keeping aspect ratio, pad the shorter side with grey.
+TARGET_SIZE = 224
+PAD_COLOR = (114, 114, 114)
+
 # Color palette for the bar chart - one color per rank position.
 # Winner (rank 0) gets a vivid color, the rest get progressively muted tones.
 BAR_COLORS = [
@@ -90,6 +95,12 @@ st.markdown("""
         margin-bottom: 0.2rem;
     }
     .subtitle {
+        text-align: center;
+        color: #666;
+        font-size: 1.2rem;
+        margin-bottom: 0.5rem;
+    }
+    .tip {
         text-align: center;
         color: #666;
         font-size: 1rem;
@@ -160,6 +171,13 @@ st.markdown("""
         font-weight: 700;
         color: #0C447C;
     }
+    .footer {
+        text-align: center;
+        color: #999;
+        font-size: 0.8rem;
+        margin-top: 3rem;
+        padding-top: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -173,7 +191,9 @@ st.markdown("""
 if "result" not in st.session_state:
     st.session_state.result = None       # last API response dict
 if "image_bytes" not in st.session_state:
-    st.session_state.image_bytes = None  # last uploaded image bytes
+    st.session_state.image_bytes = None  # last uploaded image bytes (raw)
+if "pending" not in st.session_state:
+    st.session_state.pending = False     # True when a new image awaits classification
 if "uploader_key" not in st.session_state:
     # Incrementing this key forces Streamlit to re-create the file_uploader
     # widget as a fresh, empty one - this is how we "clear" the uploader
@@ -185,21 +205,48 @@ if "uploader_key" not in st.session_state:
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def call_api(image_bytes, filename):
+def letterbox_image(img, target_size=TARGET_SIZE, pad_color=PAD_COLOR):
     """
-    Send image bytes to the /predict endpoint.
-    Returns the parsed JSON dict on success, or raises an exception.
+    Resize `img` so its longer side equals target_size while preserving the
+    aspect ratio, then center it on a square target_size x target_size canvas
+    filled with `pad_color` (grey). This mirrors the API / training
+    preprocessing so the bytes we upload are already in the exact geometry the
+    model expects (no aspect-ratio distortion).
     """
-    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
-    mime_map = {
-        "jpg": "image/jpeg", "jpeg": "image/jpeg",
-        "png": "image/png", "bmp": "image/bmp", "webp": "image/webp",
-    }
-    mime = mime_map.get(suffix, "image/jpeg")
+    img = img.convert("RGB")
+    w, h = img.size
+    scale = target_size / max(w, h)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+
+    # BILINEAR matches the default interpolation used by tf.image.resize /
+    # Keras pipelines. Keep this consistent with how the model was trained.
+    resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+    canvas = Image.new("RGB", (target_size, target_size), pad_color)
+    offset_x = (target_size - new_w) // 2
+    offset_y = (target_size - new_h) // 2
+    canvas.paste(resized, (offset_x, offset_y))
+    return canvas
+
+
+def call_api(image_bytes):
+    """
+    Preprocess `image_bytes` (EXIF orientation fix + letterbox to
+    TARGET_SIZE x TARGET_SIZE with grey padding), then POST the result to the
+    /predict endpoint. Returns the parsed JSON dict on success, or raises.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)   # honor phone EXIF orientation tag
+    img = letterbox_image(img)           # 224x224, grey (114,114,114) padding
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")          # lossless: avoids JPEG edge artifacts
+    payload = buf.getvalue()
 
     response = requests.post(
         API_URL + "/predict",
-        files={"file": (filename, image_bytes, mime)},
+        files={"file": ("image.png", payload, "image/png")},
         timeout=60,
     )
     response.raise_for_status()
@@ -243,13 +290,17 @@ def render_bar_chart(all_scores):
 
 
 # ---------------------------------------------------------------------------
-# UI
+# UI - title and instructions
 # ---------------------------------------------------------------------------
 
-# Title
 st.markdown('<div class="main-title">Welcome to the Waste Classifier!</div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="subtitle">Upload a photo of waste and I will classify it for you.</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="tip">Tip: for the best results, upload a photo of a single object '
+    'on a plain, uniform background.</div>',
     unsafe_allow_html=True,
 )
 
@@ -267,47 +318,77 @@ uploaded_file = st.file_uploader(
 )
 
 # ---------------------------------------------------------------------------
-# When a file is uploaded: call the API and store result in session_state
+# Handle a new upload: store the raw bytes in session_state and flag for
+# classification. We deliberately do NOT classify here - we want the image to
+# render first (display block below) so it appears immediately, before the
+# potentially slow API call.
 # ---------------------------------------------------------------------------
 
 if uploaded_file is not None:
     image_bytes = uploaded_file.read()
-
-    # Only call the API if this is a new image (not a re-run from something else)
     if image_bytes != st.session_state.image_bytes:
         st.session_state.image_bytes = image_bytes
-        st.session_state.result = None   # clear previous result
+        st.session_state.result = None
+        st.session_state.pending = True
 
-        # Track success outside the try block so we can call st.rerun()
-        # AFTER the try/except completes. st.rerun() works by raising an
-        # internal RerunException to halt the script - if called inside
-        # the try block, our generic `except Exception` catches it and
-        # surfaces it as "Unexpected error: RerunData(...)".
-        api_call_succeeded = False
+# ---------------------------------------------------------------------------
+# Display the uploaded image immediately from session_state.
+# Gated on image_bytes (not on result), so it shows the moment the file is
+# uploaded and persists across every rerun - including after the uploader
+# widget is cleared.
+# ---------------------------------------------------------------------------
 
-        with st.spinner("Classifying..."):
-            try:
-                result = call_api(image_bytes, uploaded_file.name)
-                st.session_state.result = result
-                # Bump the uploader key so the file_uploader widget is
-                # re-created empty on the next rerun. The result is preserved
-                # in session_state and stays visible on the page.
-                st.session_state.uploader_key += 1
-                api_call_succeeded = True
-            except requests.exceptions.ConnectionError:
-                st.error(
-                    "Cannot connect to the API at: " + API_URL +
-                    ". Make sure the API server is running."
-                )
-            except requests.exceptions.Timeout:
-                st.error("API request timed out. The model may be loading (cold start). Try again.")
-            except requests.exceptions.HTTPError as e:
-                st.error("API error: " + str(e))
-            except Exception as e:
-                st.error("Unexpected error: " + str(e))
+if st.session_state.image_bytes is not None:
+    try:
+        img = Image.open(io.BytesIO(st.session_state.image_bytes))
+        img = ImageOps.exif_transpose(img)
+        col_l, col_img, col_r = st.columns([1, 2, 1])
+        with col_img:
+            st.image(img, width="stretch")
+    except Exception:
+        # Malformed file that slipped past the type filter - reset cleanly.
+        st.error("Could not read the uploaded image. Please try a different file.")
+        st.session_state.image_bytes = None
+        st.session_state.result = None
+        st.session_state.pending = False
 
-        if api_call_succeeded:
-            st.rerun()
+# ---------------------------------------------------------------------------
+# Classify if a new image is pending. The image is already on screen (above),
+# so the user sees it together with the spinner while the model runs.
+# ---------------------------------------------------------------------------
+
+if st.session_state.pending:
+    # Track success outside the try block so we can call st.rerun() AFTER the
+    # try/except completes. st.rerun() works by raising an internal
+    # RerunException to halt the script - if called inside the try block, our
+    # generic `except Exception` catches it and surfaces it as
+    # "Unexpected error: RerunData(...)".
+    api_call_succeeded = False
+
+    with st.spinner("Classifying..."):
+        try:
+            st.session_state.result = call_api(st.session_state.image_bytes)
+            api_call_succeeded = True
+        except requests.exceptions.ConnectionError:
+            st.error(
+                "Cannot connect to the API at: " + API_URL +
+                ". Make sure the API server is running."
+            )
+        except requests.exceptions.Timeout:
+            st.error("API request timed out. The model may be loading (cold start). Try again.")
+        except requests.exceptions.HTTPError as e:
+            st.error("API error: " + str(e))
+        except Exception as e:
+            st.error("Unexpected error: " + str(e))
+
+    st.session_state.pending = False
+
+    if api_call_succeeded:
+        # Bump the uploader key so the file_uploader widget is re-created empty
+        # on the next rerun. The image and result live in session_state, so
+        # they stay visible on the page.
+        st.session_state.uploader_key += 1
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Display result if available
@@ -315,16 +396,6 @@ if uploaded_file is not None:
 
 if st.session_state.result is not None:
     result = st.session_state.result
-
-    # Show uploaded image (centered, capped width)
-    # ImageOps.exif_transpose applies the EXIF orientation tag from the file
-    # so phone photos display in the same orientation they were taken
-    # instead of being sideways or upside down.
-    col_l, col_img, col_r = st.columns([1, 2, 1])
-    with col_img:
-        img = Image.open(io.BytesIO(st.session_state.image_bytes))
-        img = ImageOps.exif_transpose(img)
-        st.image(img, width="stretch")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -342,3 +413,12 @@ if st.session_state.result is not None:
 
     # Bar chart
     render_bar_chart(result["all_scores"])
+
+# ---------------------------------------------------------------------------
+# Footer
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    '<div class="footer">&copy; 2026 Jerzy Batygolski</div>',
+    unsafe_allow_html=True,
+)
