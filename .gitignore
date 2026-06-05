@@ -15,6 +15,7 @@ Documentation/**
 !Documentation/01_Prepare_dataset.docx
 !Documentation/02_Model_training_and_evaluation.docx
 !Documentation/03_API.docx
+!Documentation/04_Application.docx
 
 Tests/**
 !Tests/test_api.py
